@@ -54,7 +54,7 @@ class Conformer(nn.Module):
             num_classes: int,
             input_dim: int = 80,
             encoder_dim: int = 512,
-            num_encoder_layers: int = 17,
+            num_encoder_layers: int = 12,
             num_attention_heads: int = 8,
             feed_forward_expansion_factor: int = 4,
             conv_expansion_factor: int = 2,
