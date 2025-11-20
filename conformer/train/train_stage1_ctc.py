@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import sys
+import os
 
 # ★★ 중요: 프로젝트 루트(/data_x/.../conformer)를 sys.path에 추가 ★★
 ROOT_DIR = Path(__file__).resolve().parents[1]  # .../conformer
@@ -14,8 +15,11 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler, autocast
 
 from tokenizer import TextTokenizer
@@ -23,11 +27,8 @@ from data.features import LogMelFeatureExtractor
 from data.collate import SpeechDataCollator
 from data.dataloader import build_dataset, build_dataloader
 from conformer import Conformer  # conformer 패키지 구조에 맞게 필요시 수정
-import os
 os.environ["HF_DATASETS_AUDIO_TORCHCODEC_DISABLED"] = "1"
-
 os.environ["CUDA_VISIBLE_DEVICES"] = "4, 5, 6, 7"
-
 
 # ------------------------------------------------------------
 # 기본 설정
@@ -111,6 +112,11 @@ config: Dict = {
         "total_steps": 250_000,
         "final_lr_scale": 0.01,
     },
+    "distributed": {
+        "enable": torch.cuda.device_count() > 1,
+        "backend": "nccl",
+        "init_method": "env://",
+    },
     "trainer": {
         "num_epochs": 30,
         "log_interval": 50,
@@ -185,6 +191,58 @@ class AverageMeter:
         return self.total / max(1, self.count)
 
 
+def init_distributed(distributed_cfg: Dict) -> Tuple[bool, int, int, int]:
+    """
+    Initialize torch.distributed if env variables are present.
+    Returns (is_distributed, rank, world_size, local_rank).
+    """
+    if not distributed_cfg.get("enable", False):
+        return False, 0, 1, 0
+
+    if not torch.cuda.is_available():
+        logging.warning(
+            "Distributed requested but CUDA is not available. Running on a single process."
+        )
+        return False, 0, 1, 0
+
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    else:
+        logging.info(
+            "Distributed config enabled but RANK/WORLD_SIZE not found. Falling back to single process."
+        )
+        return False, 0, 1, 0
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend=distributed_cfg.get("backend", "nccl"),
+        init_method=distributed_cfg.get("init_method", "env://"),
+        world_size=world_size,
+        rank=rank,
+    )
+    logging.info(
+        f"Initialized distributed training: rank {rank} / {world_size} (local rank {local_rank})"
+    )
+    return True, rank, world_size, local_rank
+
+
+def distributed_average(meter: AverageMeter, device: torch.device) -> float:
+    """
+    All-reduce AverageMeter totals to compute a global mean across workers.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return meter.avg
+
+    totals = torch.tensor(
+        [meter.total, meter.count], dtype=torch.float64, device=device
+    )
+    dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    total_loss, total_count = totals.tolist()
+    return float(total_loss / max(1.0, total_count))
+
+
 def save_checkpoint(state: Dict, checkpoint_dir: str, max_to_keep: int) -> Path:
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -218,6 +276,8 @@ def train_one_epoch(
     grad_clip: float,
     log_interval: int,
     amp_enabled: bool,
+    distributed: bool,
+    rank: int,
 ) -> Tuple[int, float]:
     model.train()
     loss_meter = AverageMeter()
@@ -273,12 +333,21 @@ def train_one_epoch(
 
         if steps_in_accum == grad_accum_steps:
             _optimizer_step()
-            if global_step > 0 and global_step % log_interval == 0:
+            if (
+                (not distributed or rank == 0)
+                and global_step > 0
+                and global_step % log_interval == 0
+            ):
                 elapsed = time.time() - start_time
                 current_lr = optimizer.param_groups[0]["lr"]
+                logged_loss = (
+                    distributed_average(loss_meter, device)
+                    if distributed
+                    else loss_meter.avg
+                )
                 logging.info(
                     f"Epoch {epoch:02d} | step {global_step} | "
-                    f"loss {loss_meter.avg:.4f} | lr {current_lr:.2e} | "
+                    f"loss {logged_loss:.4f} | lr {current_lr:.2e} | "
                     f"{elapsed:.1f}s"
                 )
                 start_time = time.time()
@@ -286,13 +355,16 @@ def train_one_epoch(
     if steps_in_accum > 0:
         _optimizer_step()
 
-    if skipped_batches:
+    if skipped_batches and (not distributed or rank == 0):
         logging.info(
             f"Epoch {epoch:02d} skipped {skipped_batches} batches "
             f"due to insufficient subsampled frames."
         )
 
-    return global_step, loss_meter.avg
+    final_loss = (
+        distributed_average(loss_meter, device) if distributed else loss_meter.avg
+    )
+    return global_step, final_loss
 
 
 def evaluate(
@@ -301,6 +373,8 @@ def evaluate(
     criterion,
     device: torch.device,
     amp_enabled: bool,
+    distributed: bool,
+    rank: int,
 ) -> float:
     model.eval()
     loss_meter = AverageMeter()
@@ -329,7 +403,10 @@ def evaluate(
 
             loss_meter.update(loss.item(), n=features.size(0))
 
-    return loss_meter.avg
+    if distributed:
+        dist.barrier()
+
+    return distributed_average(loss_meter, device) if distributed else loss_meter.avg
 
 
 def format_hours(hours: float) -> str:
@@ -343,7 +420,18 @@ def format_hours(hours: float) -> str:
 # ------------------------------------------------------------
 
 def run_training(cfg: Dict) -> Dict:
-    device = torch.device(cfg["device"])
+    distributed_cfg = cfg.get("distributed", {})
+    is_distributed, rank, world_size, local_rank = init_distributed(distributed_cfg)
+    if is_distributed:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(cfg["device"])
+    is_main_process = (not is_distributed) or rank == 0
+    set_seed(cfg["seed"] + rank)
+
+    if is_main_process:
+        dist_msg = f" | distributed x{world_size}" if is_distributed else ""
+        logging.info(f"Running Stage 1 on device: {device}{dist_msg}")
 
     # tokenizer
     tokenizer_cfg = dict(cfg["tokenizer"])
@@ -359,7 +447,10 @@ def run_training(cfg: Dict) -> Dict:
         sample_rate=cfg["data"]["sample_rate"], **feature_kwargs
     )
 
-    # datasets
+    # datasets (rank0가 먼저 다운로드 후 동기화)
+    if is_distributed and rank != 0:
+        dist.barrier()
+
     train_dataset = build_dataset(
         cfg,
         tokenizer,
@@ -374,6 +465,9 @@ def run_training(cfg: Dict) -> Dict:
         split=valid_split,
     )
 
+    if is_distributed and rank == 0:
+        dist.barrier()
+
     # collator / dataloader
     subsampling_factor = max(1, cfg["model"].get("subsampling_factor", 1))
     min_subsample_len_multiplier = cfg["model"].get(
@@ -385,17 +479,40 @@ def run_training(cfg: Dict) -> Dict:
         min_subsample_len_multiplier=min_subsample_len_multiplier,
     )
 
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=cfg["dataloader"].get("shuffle", True),
+        )
+        if is_distributed
+        else None
+    )
+    valid_sampler = (
+        DistributedSampler(
+            valid_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+        )
+        if is_distributed
+        else None
+    )
+
     train_loader = build_dataloader(
         train_dataset,
         collate_fn,
         cfg["dataloader"],
-        shuffle=cfg["dataloader"].get("shuffle", True),
+        shuffle=train_sampler is None and cfg["dataloader"].get("shuffle", True),
+        sampler=train_sampler,
     )
     valid_loader = build_dataloader(
         valid_dataset,
         collate_fn,
         cfg["dataloader"],
         shuffle=False,
+        sampler=valid_sampler,
     )
 
     # logging dataset info
@@ -407,14 +524,15 @@ def run_training(cfg: Dict) -> Dict:
         * 1000
     )
     effective_stride = frame_ms * subsampling_factor
-    logging.info(
-        f"Train set: {len(train_dataset)} utterances ({hours_train}), "
-        f"Valid set: {len(valid_dataset)} utterances ({hours_valid})"
-    )
-    logging.info(
-        f"Subsampling factor {subsampling_factor} "
-        f"⇒ encoder frame rate ≈ {effective_stride:.1f} ms"
-    )
+    if is_main_process:
+        logging.info(
+            f"Train set: {len(train_dataset)} utterances ({hours_train}), "
+            f"Valid set: {len(valid_dataset)} utterances ({hours_valid})"
+        )
+        logging.info(
+            f"Subsampling factor {subsampling_factor} "
+            f"⇒ encoder frame rate ≈ {effective_stride:.1f} ms"
+        )
 
     # model
     num_classes = tokenizer.vocab_size
@@ -433,7 +551,12 @@ def run_training(cfg: Dict) -> Dict:
         conv_dropout_p=cfg["model"]["dropout"],
     ).to(device)
 
-    logging.info(f"Conformer parameters: {model.count_parameters():,}")
+    param_count = model.count_parameters()
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    if is_main_process:
+        logging.info(f"Conformer parameters: {param_count:,}")
 
     # optim / scheduler / amp
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
@@ -451,7 +574,7 @@ def run_training(cfg: Dict) -> Dict:
         final_lr_scale=cfg["scheduler"]["final_lr_scale"],
     )
 
-    amp_enabled = bool(cfg["trainer"]["use_amp"] and torch.cuda.is_available())
+    amp_enabled = bool(cfg["trainer"]["use_amp"] and device.type == "cuda")
     scaler = GradScaler(enabled=amp_enabled)
 
     # resume 설정
@@ -463,7 +586,15 @@ def run_training(cfg: Dict) -> Dict:
     resume_path = cfg["trainer"].get("resume_from")
     if resume_path:
         ckpt = torch.load(resume_path, map_location=device)
-        model.load_state_dict(ckpt["model_state"])
+        model_to_load = model.module if isinstance(model, DDP) else model
+        try:
+            model_to_load.load_state_dict(ckpt["model_state"])
+        except RuntimeError:
+            # 호환성을 위해 module. prefix가 있으면 제거해서 로드
+            cleaned = {
+                k.replace("module.", "", 1): v for k, v in ckpt["model_state"].items()
+            }
+            model_to_load.load_state_dict(cleaned)
         optimizer.load_state_dict(ckpt["optim_state"])
         scheduler.load_state_dict(ckpt["scheduler_state"])
         if "scaler_state" in ckpt and amp_enabled and ckpt["scaler_state"] is not None:
@@ -473,10 +604,14 @@ def run_training(cfg: Dict) -> Dict:
         global_step = ckpt.get("global_step", 0)
         best_val = ckpt.get("best_val", best_val)
         best_path = Path(resume_path)
-        logging.info(f"Resumed from {resume_path} (epoch {ckpt['epoch']})")
+        if is_main_process:
+            logging.info(f"Resumed from {resume_path} (epoch {ckpt['epoch']})")
 
     # training loop
     for epoch in range(start_epoch, cfg["trainer"]["num_epochs"] + 1):
+        if is_distributed and isinstance(train_loader.sampler, DistributedSampler):
+            train_loader.sampler.set_epoch(epoch)
+
         global_step, train_loss = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -491,6 +626,8 @@ def run_training(cfg: Dict) -> Dict:
             grad_clip=cfg["trainer"]["grad_clip"],
             log_interval=cfg["trainer"]["log_interval"],
             amp_enabled=amp_enabled,
+            distributed=is_distributed,
+            rank=rank,
         )
 
         if epoch % cfg["trainer"]["val_interval"] == 0:
@@ -500,36 +637,46 @@ def run_training(cfg: Dict) -> Dict:
                 criterion=criterion,
                 device=device,
                 amp_enabled=amp_enabled,
+                distributed=is_distributed,
+                rank=rank,
             )
             improved = val_loss < best_val
             if improved:
                 best_val = val_loss
 
-            ckpt_state = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "val_loss": float(val_loss),
-                "best_val": float(best_val),
-                "model_state": model.state_dict(),
-                "optim_state": optimizer.state_dict(),
-                "scheduler_state": scheduler.state_dict(),
-                "scaler_state": scaler.state_dict() if amp_enabled else None,
-                "config": cfg,
-            }
-            ckpt_path = save_checkpoint(
-                ckpt_state,
-                cfg["trainer"]["checkpoint_dir"],
-                cfg["trainer"]["max_to_keep"],
-            )
-            if improved:
-                best_path = ckpt_path
+            if is_main_process:
+                ckpt_state = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "val_loss": float(val_loss),
+                    "best_val": float(best_val),
+                    "model_state": (
+                        model.module.state_dict()
+                        if isinstance(model, DDP)
+                        else model.state_dict()
+                    ),
+                    "optim_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "scaler_state": scaler.state_dict() if amp_enabled else None,
+                    "config": cfg,
+                }
+                ckpt_path = save_checkpoint(
+                    ckpt_state,
+                    cfg["trainer"]["checkpoint_dir"],
+                    cfg["trainer"]["max_to_keep"],
+                )
+                if improved:
+                    best_path = ckpt_path
 
-            logging.info(
-                f"Epoch {epoch:02d} | train loss {train_loss:.4f} | "
-                f"val loss {val_loss:.4f} | best {best_val:.4f}"
-            )
-        else:
+                logging.info(
+                    f"Epoch {epoch:02d} | train loss {train_loss:.4f} | "
+                    f"val loss {val_loss:.4f} | best {best_val:.4f}"
+                )
+        elif is_main_process:
             logging.info(f"Epoch {epoch:02d} | train loss {train_loss:.4f}")
+
+        if is_distributed:
+            dist.barrier()
 
     return {
         "best_val_loss": best_val,
@@ -543,15 +690,16 @@ def run_training(cfg: Dict) -> Dict:
 # ------------------------------------------------------------
 
 if __name__ == "__main__":
-    set_seed(config["seed"])
     Path(config["trainer"]["checkpoint_dir"]).mkdir(parents=True, exist_ok=True)
-    logging.info(f"Running Stage 1 on device: {config['device']}")
-
-    # GPU 선택은 셸에서:
-    #   CUDA_VISIBLE_DEVICES=4,5,6,7 python train_stage1_ctc.py
+    # 멀티 GPU 실행 예시:
+    #   torchrun --standalone --nproc_per_node=4 conformer/train/train_stage1_ctc.py
     try:
         trainer_state = run_training(config)
-        print(trainer_state)
+        is_main = ("RANK" not in os.environ) or os.environ.get("RANK", "0") == "0"
+        if is_main:
+            print(trainer_state)
     except Exception as exc:
         logging.exception("Training loop aborted.")
-        print(f"Training loop aborted: {exc}")
+        is_main = ("RANK" not in os.environ) or os.environ.get("RANK", "0") == "0"
+        if is_main:
+            print(f"Training loop aborted: {exc}")
