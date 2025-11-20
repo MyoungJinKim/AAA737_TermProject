@@ -6,12 +6,13 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import logging
+import io
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-
 from datasets import load_dataset, Audio
+import soundfile as sf
 
 from tokenizer import TextTokenizer
 from .features import LogMelFeatureExtractor
@@ -74,7 +75,8 @@ class HuggingFaceSpeechDataset(Dataset):
         )
 
         # 오디오 컬럼을 지정한 sample_rate 로 캐스팅
-        ds = ds.cast_column(self.audio_column, Audio(sampling_rate=self.sample_rate))
+        #ds = ds.cast_column(self.audio_column, Audio(sampling_rate=self.sample_rate))
+        ds = ds.cast_column(self.audio_column, Audio(decode=False))
 
         # 실제 컬럼 목록
         col_names = list(ds.column_names)
@@ -156,9 +158,17 @@ class HuggingFaceSpeechDataset(Dataset):
         ex = self.dataset[idx]
 
         # ----- 오디오 로드 -----
+        import torchaudio
         audio_dict = ex[self.audio_column]
+        
+        
+        waveform, sr = torchaudio.load(io.BytesIO(audio_dict["bytes"]))  # file-like object 사용
+
+        #byte_buf = io.BytesIO(audio_dict["bytes"])
+        #data, sr = sf.read(byte_buf, dtype="float32")
+        
         # datasets.Audio 로 캐스팅했으므로 'array' 키에 numpy 1D 또는 2D 가 들어있음
-        wav = torch.tensor(audio_dict["array"], dtype=torch.float32)
+        wav = torch.tensor(waveform, dtype=torch.float32)
         if wav.dim() == 1:
             wav = wav.unsqueeze(0)  # [1, T]
 

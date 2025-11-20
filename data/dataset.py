@@ -69,7 +69,8 @@ class HuggingFaceSpeechDataset(Dataset):
         )
 
         # 오디오 컬럼을 지정한 sample_rate 로 캐스팅
-        ds = ds.cast_column(self.audio_column, Audio(sampling_rate=self.sample_rate))
+        # ds = ds.cast_column(self.audio_column, Audio(sampling_rate=self.sample_rate))
+        ds = ds.cast_column(self.audio_column, Audio(decode=False))
 
         col_names = list(ds.column_names)
 
@@ -153,8 +154,8 @@ class HuggingFaceSpeechDataset(Dataset):
         ex = self.dataset[idx]
 
         # ----- 오디오 로드 -----
-        audio_dict = ex[self.audio_column]  # {"array": np.ndarray, ...}
-        wav = torch.tensor(audio_dict["array"], dtype=torch.float32)
+        audio_dict = ex[self.audio_column]  # {"bytes": np.ndarray, ...}
+        wav = torch.tensor(audio_dict["bytes"], dtype=torch.float32)
         if wav.dim() == 1:
             wav = wav.unsqueeze(0)  # [1, T]
 
