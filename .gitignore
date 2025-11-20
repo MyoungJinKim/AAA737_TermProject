@@ -1,0 +1,74 @@
+########################
+# Python 캐시 / 빌드 산출물
+########################
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C 확장 빌드 산출물
+*.so
+
+# 패키징 / 빌드
+build/
+dist/
+*.egg-info/
+.eggs/
+
+########################
+# 가상환경
+########################
+.venv/
+venv/
+env/
+ENV/
+
+########################
+# Jupyter, 테스트 캐시
+########################
+.ipynb_checkpoints/
+.pytest_cache/
+.coverage
+htmlcov/
+
+########################
+# IDE / OS 파일
+########################
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+########################
+# 로그 / 런 기록
+########################
+*.log
+logs/
+runs/
+wandb/
+tensorboard/
+tb_logs/
+
+########################
+# 모델 체크포인트 / 큰 바이너리
+########################
+checkpoints/
+ckpt/
+*.pt
+*.pth
+*.bin
+
+########################
+# HuggingFace / dataset cache
+########################
+# conformer 내부 HF 캐시 전체 무시
+conformer/data/hf-cache/
+
+# (선택) 전체 .arrow 파일 무시 (HF datasets가 주로 사용)
+*.arrow
+
+########################
+# Python bytecode / cache
+########################
+# 모든 하위 디렉토리의 __pycache__ 폴더 무시
+**/__pycache__/
