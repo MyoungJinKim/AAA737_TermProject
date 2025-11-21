@@ -1,3 +1,16 @@
+"""
+
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+export TOKENIZERS_PARALLELISM=false  # 선택
+export NCCL_P2P_DISABLE=1
+
+torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  train_stage1_ctc.py
+
+"""
+
 from __future__ import annotations
 
 import math
@@ -5,7 +18,7 @@ import time
 import random
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Callable
 import sys
 import os
 
@@ -20,15 +33,21 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler
+from torch.amp import autocast   # ### CHANGED: 새 autocast API 사용
+
+try:
+    import wandb  # ### NEW: wandb 연동
+except ImportError:
+    wandb = None
 
 from tokenizer import TextTokenizer
 from data.features import LogMelFeatureExtractor
 from data.collate import SpeechDataCollator
 from data.dataloader import build_dataset, build_dataloader
 from conformer import Conformer  # conformer 패키지 구조에 맞게 필요시 수정
-os.environ["HF_DATASETS_AUDIO_TORCHCODEC_DISABLED"] = "1"
-os.environ["CUDA_VISIBLE_DEVICES"] = "4, 5, 6, 7"
+#os.environ["HF_DATASETS_AUDIO_TORCHCODEC_DISABLED"] = "1"
+#os.environ["CUDA_VISIBLE_DEVICES"] = "4, 5, 6, 7"
 
 # ------------------------------------------------------------
 # 기본 설정
@@ -83,7 +102,7 @@ config: Dict = {
     "model": {
         "input_dim": 80,
         "encoder_dim": 512,
-        "num_layers": 3,
+        "num_layers": 8,
         "num_attention_heads": 8,
         "feed_forward_expansion_factor": 4,
         "conv_expansion_factor": 2,
@@ -93,8 +112,8 @@ config: Dict = {
         "min_subsample_len_multiplier": 2,
     },
     "dataloader": {
-        "batch_size": 4,
-        "num_workers": 4,
+        "batch_size": 256,
+        "num_workers": 16,
         "pin_memory": True,
         "prefetch_factor": 2,
         "persistent_workers": False,
@@ -109,8 +128,8 @@ config: Dict = {
     },
     "scheduler": {
         "warmup_steps": 20_000,
-        "total_steps": 250_000,
-        "final_lr_scale": 0.01,
+        "decay_factor": 0.99995,   # warmup 이후 step마다 곱해질 decay factor
+        "min_lr_scale": 0.05,      # lr가 base_lr * min_lr_scale 이하로 내려가지 않게 clamp
     },
     "distributed": {
         "enable": torch.cuda.device_count() > 1,
@@ -118,14 +137,22 @@ config: Dict = {
         "init_method": "env://",
     },
     "trainer": {
-        "num_epochs": 30,
+        "num_epochs": 1,
         "log_interval": 50,
-        "val_interval": 1,
+        # "val_interval": 1,0
+        "val_steps": 5000,       # ★ 5000 step마다 validation
+        "ckpt_steps": 10000,     # ★ 10000 step마다 checkpoint 저장
         "grad_clip": 5.0,
         "use_amp": True,
         "checkpoint_dir": "checkpoints/stage1",
         "max_to_keep": 5,
         "resume_from": None,
+    },
+        "wandb": {  # ### NEW: wandb 설정
+        "enable": True,
+        "project": "conformer-stage1-ctc",
+        "entity": None,       # 필요하면 본인 entity로 설정
+        "run_name": None,     # None이면 자동 이름
     },
 }
 
@@ -134,41 +161,38 @@ config: Dict = {
 # 스케줄러 / 유틸
 # ------------------------------------------------------------
 
-class WarmupExponentialDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
+class WarmupExpDecayScheduler(torch.optim.lr_scheduler._LRScheduler):
     """
-    warmup 이후 exponential decay로 lr를 줄이는 스케줄러.
+    warmup 이후 step마다 decay_factor를 곱하는 exponential decay 스케줄러.
+    total_steps 없이 동작.
+    lr(step) = base_lr * scale
+      - step <= warmup_steps: scale = step / warmup_steps (linear warmup)
+      - step >  warmup_steps: scale = max(min_lr_scale, decay_factor ** (step - warmup_steps))
     """
 
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
         warmup_steps: int,
-        total_steps: int,
-        final_lr_scale: float,
+        decay_factor: float,
+        min_lr_scale: float = 0.05,
         last_epoch: int = -1,
     ):
         self.warmup_steps = max(1, warmup_steps)
-        self.total_steps = max(total_steps, self.warmup_steps + 1)
-        self.final_lr_scale = final_lr_scale
+        self.decay_factor = float(decay_factor)
+        self.min_lr_scale = float(min_lr_scale)
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         step = max(1, self.last_epoch + 1)
 
         if step <= self.warmup_steps:
-            # linear warmup
             scale = step / self.warmup_steps
         else:
-            # exponential decay from 1.0 → final_lr_scale
-            progress = min(
-                1.0,
-                (step - self.warmup_steps)
-                / (self.total_steps - self.warmup_steps),
-            )
-            scale = math.exp(math.log(self.final_lr_scale) * progress)
+            decay_steps = step - self.warmup_steps
+            scale = max(self.min_lr_scale, self.decay_factor ** decay_steps)
 
         return [base_lr * scale for base_lr in self.base_lrs]
-
 
 class AverageMeter:
     """
@@ -267,7 +291,7 @@ def train_one_epoch(
     dataloader: DataLoader,
     criterion,
     optimizer: torch.optim.Optimizer,
-    scheduler: WarmupExponentialDecayScheduler,
+    scheduler: WarmupExpDecayScheduler,
     scaler: GradScaler,
     device: torch.device,
     epoch: int,
@@ -278,6 +302,8 @@ def train_one_epoch(
     amp_enabled: bool,
     distributed: bool,
     rank: int,
+    use_wandb: bool,
+    on_step_end: Optional[Callable[[int, AverageMeter], None]] = None,  # ★ 추가
 ) -> Tuple[int, float]:
     model.train()
     loss_meter = AverageMeter()
@@ -285,6 +311,7 @@ def train_one_epoch(
     steps_in_accum = 0
     start_time = time.time()
     skipped_batches = 0
+    is_main = (not distributed) or (rank == 0)
 
     def _optimizer_step():
         nonlocal global_step, steps_in_accum
@@ -305,20 +332,22 @@ def train_one_epoch(
         if batch is None:
             continue
 
-        features, input_lengths, targets, target_lengths, _ = batch
-        features = features.to(device)
-        input_lengths = input_lengths.to(device)
-        targets = targets.to(device)
-        target_lengths = target_lengths.to(device)
 
-        with autocast(enabled=amp_enabled):
+        features, input_lengths, targets, target_lengths, _ = batch
+        features = features.to(device, non_blocking=True)
+        input_lengths = input_lengths.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        target_lengths = target_lengths.to(device, non_blocking=True)
+
+        # ### CHANGED: 새 autocast API
+        with autocast(device_type="cuda", enabled=amp_enabled):
             logits, logit_lengths = model(features, input_lengths)
 
         if torch.any(target_lengths > logit_lengths):
             skipped_batches += 1
             continue
 
-        with autocast(enabled=amp_enabled):
+        with autocast(device_type="cuda", enabled=amp_enabled):
             loss = criterion(
                 logits.transpose(0, 1),  # [T, B, C]
                 targets,
@@ -327,30 +356,46 @@ def train_one_epoch(
             )
             loss = loss / grad_accum_steps
 
+
         scaler.scale(loss).backward()
         steps_in_accum += 1
         loss_meter.update(loss.item() * grad_accum_steps, n=features.size(0))
 
+
         if steps_in_accum == grad_accum_steps:
             _optimizer_step()
-            if (
-                (not distributed or rank == 0)
-                and global_step > 0
-                and global_step % log_interval == 0
-            ):
-                elapsed = time.time() - start_time
-                current_lr = optimizer.param_groups[0]["lr"]
+
+            # 모든 rank에서 동일하게 진입해야 함
+            if global_step > 0 and global_step % log_interval == 0:
+                # 여기서는 각 rank가 모두 distributed_average를 호출
                 logged_loss = (
                     distributed_average(loss_meter, device)
                     if distributed
                     else loss_meter.avg
                 )
-                logging.info(
-                    f"Epoch {epoch:02d} | step {global_step} | "
-                    f"loss {logged_loss:.4f} | lr {current_lr:.2e} | "
-                    f"{elapsed:.1f}s"
-                )
-                start_time = time.time()
+
+                if is_main:
+                    elapsed = time.time() - start_time
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    logging.info(
+                        f"Epoch {epoch:02d} | step {global_step} | "
+                        f"loss {logged_loss:.4f} | lr {current_lr:.2e} | "
+                        f"{elapsed:.1f}s"
+                    )
+                    if use_wandb and wandb is not None:
+                        wandb.log(
+                            {
+                                "train/loss": logged_loss,
+                                "train/lr": current_lr,
+                                "train/epoch": epoch,
+                                "train/step": global_step,
+                            },
+                            step=global_step,
+                        )
+                    start_time = time.time()
+            # ★ step 종료 콜백 (모든 rank에서 동일하게 호출)
+            if on_step_end is not None:
+                on_step_end(global_step, loss_meter)
 
     if steps_in_accum > 0:
         _optimizer_step()
@@ -376,6 +421,8 @@ def evaluate(
     distributed: bool,
     rank: int,
 ) -> float:
+    was_training = model.training  # ★ 추가
+
     model.eval()
     loss_meter = AverageMeter()
 
@@ -385,12 +432,12 @@ def evaluate(
                 continue
 
             features, input_lengths, targets, target_lengths, _ = batch
-            features = features.to(device)
-            input_lengths = input_lengths.to(device)
-            targets = targets.to(device)
-            target_lengths = target_lengths.to(device)
+            features = features.to(device, non_blocking=True)
+            input_lengths = input_lengths.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            target_lengths = target_lengths.to(device, non_blocking=True)
 
-            with autocast(enabled=amp_enabled):
+            with autocast(device_type="cuda", enabled=amp_enabled):
                 logits, logit_lengths = model(features, input_lengths)
                 if torch.any(target_lengths > logit_lengths):
                     continue
@@ -402,11 +449,13 @@ def evaluate(
                 )
 
             loss_meter.update(loss.item(), n=features.size(0))
+    val_loss = distributed_average(loss_meter, device) if distributed else loss_meter.avg
 
-    if distributed:
-        dist.barrier()
-
-    return distributed_average(loss_meter, device) if distributed else loss_meter.avg
+    # if distributed:
+    #     dist.barrier()
+    if was_training:
+        model.train()   # ★ 원래 상태 복원
+    return val_loss
 
 
 def format_hours(hours: float) -> str:
@@ -429,6 +478,18 @@ def run_training(cfg: Dict) -> Dict:
     is_main_process = (not is_distributed) or rank == 0
     set_seed(cfg["seed"] + rank)
 
+    # wandb init (main 프로세스만)
+    wandb_cfg = cfg.get("wandb", {})
+    use_wandb = bool(wandb_cfg.get("enable", False) and wandb is not None and is_main_process)
+    if use_wandb:
+        run_name = wandb_cfg.get("run_name") or cfg["experiment_name"]
+        wandb.init(
+            project=wandb_cfg.get("project", "conformer-stage1-ctc"),
+            entity=wandb_cfg.get("entity", None),
+            name=run_name,
+            config=cfg,
+        )
+
     if is_main_process:
         dist_msg = f" | distributed x{world_size}" if is_distributed else ""
         logging.info(f"Running Stage 1 on device: {device}{dist_msg}")
@@ -447,9 +508,9 @@ def run_training(cfg: Dict) -> Dict:
         sample_rate=cfg["data"]["sample_rate"], **feature_kwargs
     )
 
-    # datasets (rank0가 먼저 다운로드 후 동기화)
-    if is_distributed and rank != 0:
-        dist.barrier()
+    # # datasets (rank0가 먼저 다운로드 후 동기화)
+    # if is_distributed and rank != 0:
+    #     dist.barrier()
 
     train_dataset = build_dataset(
         cfg,
@@ -465,8 +526,8 @@ def run_training(cfg: Dict) -> Dict:
         split=valid_split,
     )
 
-    if is_distributed and rank == 0:
-        dist.barrier()
+    # if is_distributed and rank == 0:
+    #     dist.barrier()
 
     # collator / dataloader
     subsampling_factor = max(1, cfg["model"].get("subsampling_factor", 1))
@@ -514,26 +575,6 @@ def run_training(cfg: Dict) -> Dict:
         shuffle=False,
         sampler=valid_sampler,
     )
-
-    # logging dataset info
-    hours_train = format_hours(getattr(train_dataset, "total_hours", 0.0))
-    hours_valid = format_hours(getattr(valid_dataset, "total_hours", 0.0))
-    frame_ms = (
-        cfg["feature_extractor"].get("hop_length", 160)
-        / cfg["data"]["sample_rate"]
-        * 1000
-    )
-    effective_stride = frame_ms * subsampling_factor
-    if is_main_process:
-        logging.info(
-            f"Train set: {len(train_dataset)} utterances ({hours_train}), "
-            f"Valid set: {len(valid_dataset)} utterances ({hours_valid})"
-        )
-        logging.info(
-            f"Subsampling factor {subsampling_factor} "
-            f"⇒ encoder frame rate ≈ {effective_stride:.1f} ms"
-        )
-
     # model
     num_classes = tokenizer.vocab_size
     model = Conformer(
@@ -567,11 +608,11 @@ def run_training(cfg: Dict) -> Dict:
         eps=cfg["optim"]["eps"],
         weight_decay=cfg["optim"]["weight_decay"],
     )
-    scheduler = WarmupExponentialDecayScheduler(
+    scheduler = WarmupExpDecayScheduler(
         optimizer,
         warmup_steps=cfg["scheduler"]["warmup_steps"],
-        total_steps=cfg["scheduler"]["total_steps"],
-        final_lr_scale=cfg["scheduler"]["final_lr_scale"],
+        decay_factor=cfg["scheduler"]["decay_factor"],
+        min_lr_scale=cfg["scheduler"]["min_lr_scale"],
     )
 
     amp_enabled = bool(cfg["trainer"]["use_amp"] and device.type == "cuda")
@@ -580,8 +621,15 @@ def run_training(cfg: Dict) -> Dict:
     # resume 설정
     start_epoch = 1
     global_step = 0
+
+    # step 단위 eval / ckpt 설정
+    val_every_steps = cfg["trainer"].get("val_steps", None)
+    ckpt_every_steps = cfg["trainer"].get("ckpt_steps", None)
+
     best_val = float("inf")
     best_path: Optional[Path] = None
+    last_val_loss = float("inf")
+
 
     resume_path = cfg["trainer"].get("resume_from")
     if resume_path:
@@ -607,11 +655,98 @@ def run_training(cfg: Dict) -> Dict:
         if is_main_process:
             logging.info(f"Resumed from {resume_path} (epoch {ckpt['epoch']})")
 
-    # training loop
     for epoch in range(start_epoch, cfg["trainer"]["num_epochs"] + 1):
         if is_distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
 
+        # ★ epoch마다 새 on_step_end 콜백 정의 (epoch 캡처)
+        def on_step_end(global_step_inner: int, loss_meter: AverageMeter):
+            nonlocal best_val, best_path, last_val_loss
+
+            # 1) validation: 모든 rank에서 동일한 step에서 호출
+            if val_every_steps and global_step_inner > 0 and global_step_inner % val_every_steps == 0:
+                val_loss = evaluate(
+                    model=model,
+                    dataloader=valid_loader,
+                    criterion=criterion,
+                    device=device,
+                    amp_enabled=amp_enabled,
+                    distributed=is_distributed,
+                    rank=rank,
+                )
+                last_val_loss = float(val_loss)
+                improved = val_loss < best_val
+                if improved:
+                    best_val = val_loss
+
+                if is_main_process:
+                    logging.info(
+                        f"[VAL] Epoch {epoch:02d} | step {global_step_inner} | "
+                        f"val loss {val_loss:.4f} | best {best_val:.4f}"
+                    )
+                    if use_wandb and wandb is not None:
+                        wandb.log(
+                            {
+                                "val/loss": val_loss,
+                                "val/best": best_val,
+                                "val/epoch": epoch,
+                                "val/step": global_step_inner,
+                            },
+                            step=global_step_inner,
+                        )
+                    # best일 때 별도의 best ckpt를 저장해도 됨
+                    if improved:
+                        ckpt_state = {
+                            "epoch": epoch,
+                            "global_step": global_step_inner,
+                            "val_loss": float(val_loss),
+                            "best_val": float(best_val),
+                            "model_state": (
+                                model.module.state_dict()
+                                if isinstance(model, DDP)
+                                else model.state_dict()
+                            ),
+                            "optim_state": optimizer.state_dict(),
+                            "scheduler_state": scheduler.state_dict(),
+                            "scaler_state": scaler.state_dict() if amp_enabled else None,
+                            "config": cfg,
+                        }
+                        best_path = save_checkpoint(
+                            ckpt_state,
+                            cfg["trainer"]["checkpoint_dir"],
+                            cfg["trainer"]["max_to_keep"],
+                        )
+                        logging.info(f"[VAL] New best checkpoint: {best_path}")
+
+            # 2) 주기적 checkpoint (validation 여부와 무관)
+            if ckpt_every_steps and global_step_inner > 0 and global_step_inner % ckpt_every_steps == 0:
+                if is_main_process:
+                    ckpt_state = {
+                        "epoch": epoch,
+                        "global_step": global_step_inner,
+                        "val_loss": float(last_val_loss),
+                        "best_val": float(best_val),
+                        "model_state": (
+                            model.module.state_dict()
+                            if isinstance(model, DDP)
+                            else model.state_dict()
+                        ),
+                        "optim_state": optimizer.state_dict(),
+                        "scheduler_state": scheduler.state_dict(),
+                        "scaler_state": scaler.state_dict() if amp_enabled else None,
+                        "config": cfg,
+                    }
+                    ckpt_path = save_checkpoint(
+                        ckpt_state,
+                        cfg["trainer"]["checkpoint_dir"],
+                        cfg["trainer"]["max_to_keep"],
+                    )
+                    logging.info(
+                        f"[CKPT] Epoch {epoch:02d} | step {global_step_inner} | "
+                        f"ckpt saved to {ckpt_path}"
+                    )
+
+        # ★ 한 epoch 학습 (안에서 on_step_end로 step 단위 eval/ckpt 수행)
         global_step, train_loss = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -628,56 +763,24 @@ def run_training(cfg: Dict) -> Dict:
             amp_enabled=amp_enabled,
             distributed=is_distributed,
             rank=rank,
+            use_wandb=use_wandb,
+            on_step_end=on_step_end,
         )
 
-        if epoch % cfg["trainer"]["val_interval"] == 0:
-            val_loss = evaluate(
-                model=model,
-                dataloader=valid_loader,
-                criterion=criterion,
-                device=device,
-                amp_enabled=amp_enabled,
-                distributed=is_distributed,
-                rank=rank,
-            )
-            improved = val_loss < best_val
-            if improved:
-                best_val = val_loss
-
-            if is_main_process:
-                ckpt_state = {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "val_loss": float(val_loss),
-                    "best_val": float(best_val),
-                    "model_state": (
-                        model.module.state_dict()
-                        if isinstance(model, DDP)
-                        else model.state_dict()
-                    ),
-                    "optim_state": optimizer.state_dict(),
-                    "scheduler_state": scheduler.state_dict(),
-                    "scaler_state": scaler.state_dict() if amp_enabled else None,
-                    "config": cfg,
-                }
-                ckpt_path = save_checkpoint(
-                    ckpt_state,
-                    cfg["trainer"]["checkpoint_dir"],
-                    cfg["trainer"]["max_to_keep"],
-                )
-                if improved:
-                    best_path = ckpt_path
-
-                logging.info(
-                    f"Epoch {epoch:02d} | train loss {train_loss:.4f} | "
-                    f"val loss {val_loss:.4f} | best {best_val:.4f}"
-                )
-        elif is_main_process:
+        # epoch 단위 요약 로그 (선택)
+        if is_main_process:
             logging.info(f"Epoch {epoch:02d} | train loss {train_loss:.4f}")
+            if use_wandb and wandb is not None:
+                wandb.log(
+                    {
+                        "train/loss_epoch": train_loss,
+                        "epoch": epoch,
+                    },
+                    step=global_step,
+                )
 
-        if is_distributed:
-            dist.barrier()
-
+    if use_wandb and wandb is not None and is_main_process:
+        wandb.finish()
     return {
         "best_val_loss": best_val,
         "best_checkpoint": str(best_path) if best_path else None,
