@@ -80,3 +80,6 @@ conformer/data/hf-cache/
 data/hf-cache/
 *.arrow
 *.lock
+
+
+output directory/
