@@ -13,7 +13,7 @@ import yaml
 from pathlib import Path
 from data.dataloader import build_dataset, build_dataloader
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4, 5, 6, 7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"
 CONFIG_PATH = Path("/data_x/aa007878/deep/myung/configs/config.yaml")
 
 

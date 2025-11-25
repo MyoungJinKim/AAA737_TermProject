@@ -1,6 +1,6 @@
 """
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export TOKENIZERS_PARALLELISM=false  # 선택
 export NCCL_P2P_DISABLE=1
 
@@ -102,7 +102,7 @@ config: Dict = {
     "model": {
         "input_dim": 80,
         "encoder_dim": 512,
-        "num_layers": 8,
+        "num_layers": 12,
         "num_attention_heads": 8,
         "feed_forward_expansion_factor": 4,
         "conv_expansion_factor": 2,
@@ -112,7 +112,7 @@ config: Dict = {
         "min_subsample_len_multiplier": 2,
     },
     "dataloader": {
-        "batch_size": 256,
+        "batch_size": 32,
         "num_workers": 16,
         "pin_memory": True,
         "prefetch_factor": 2,
@@ -127,7 +127,7 @@ config: Dict = {
         "grad_accum_steps": 4,
     },
     "scheduler": {
-        "warmup_steps": 20_000,
+        "warmup_steps": 30000,
         "decay_factor": 0.99995,   # warmup 이후 step마다 곱해질 decay factor
         "min_lr_scale": 0.05,      # lr가 base_lr * min_lr_scale 이하로 내려가지 않게 clamp
     },
@@ -140,11 +140,11 @@ config: Dict = {
         "num_epochs": 1,
         "log_interval": 50,
         # "val_interval": 1,0
-        "val_steps": 5000,       # ★ 5000 step마다 validation
-        "ckpt_steps": 10000,     # ★ 10000 step마다 checkpoint 저장
+        "val_steps": 1000,       # ★ 1000 step마다 validation
+        "ckpt_steps": 5000,     # ★ 5000 step마다 checkpoint 저장
         "grad_clip": 5.0,
         "use_amp": True,
-        "checkpoint_dir": "checkpoints/stage1",
+        "checkpoint_dir": "checkpoints/stage1_ctc_layer12_batch32",
         "max_to_keep": 5,
         "resume_from": None,
     },
@@ -152,7 +152,7 @@ config: Dict = {
         "enable": True,
         "project": "conformer-stage1-ctc",
         "entity": None,       # 필요하면 본인 entity로 설정
-        "run_name": None,     # None이면 자동 이름
+        "run_name": "layer_12_batch_32_warmup30k",     # None이면 자동 이름
     },
 }
 
@@ -267,16 +267,37 @@ def distributed_average(meter: AverageMeter, device: torch.device) -> float:
     return float(total_loss / max(1.0, total_count))
 
 
-def save_checkpoint(state: Dict, checkpoint_dir: str, max_to_keep: int) -> Path:
+def save_checkpoint(
+    state: Dict,
+    checkpoint_dir: str,
+    max_to_keep: int,
+    *,
+    is_best: bool = False,
+) -> Path:
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     ckpt_path = checkpoint_dir / f"epoch{state['epoch']:02d}_val{state['val_loss']:.4f}.pt"
     torch.save(state, ckpt_path)
 
-    checkpoints = sorted(checkpoint_dir.glob("epoch*.pt"))
-    if len(checkpoints) > max_to_keep:
-        for stale in checkpoints[:-max_to_keep]:
+    record_path = checkpoint_dir / "best_checkpoint.txt"
+    protected_name: Optional[str] = None
+    if record_path.exists():
+        protected_name = record_path.read_text().strip() or None
+
+    if is_best:
+        protected_name = ckpt_path.name
+        record_path.write_text(protected_name)
+
+    checkpoints = sorted(
+        checkpoint_dir.glob("epoch*.pt"),
+        key=lambda p: p.stat().st_mtime,
+    )
+
+    # best checkpoint는 항상 보호하고, 나머지는 최신 max_to_keep개만 유지
+    removable = [p for p in checkpoints if not protected_name or p.name != protected_name]
+    if len(removable) > max_to_keep:
+        for stale in removable[:-max_to_keep]:
             stale.unlink(missing_ok=True)
 
     return ckpt_path
@@ -328,6 +349,39 @@ def train_one_epoch(
         global_step += 1
         steps_in_accum = 0
 
+    def _after_optimizer_step():
+        nonlocal start_time
+
+        if global_step > 0 and global_step % log_interval == 0:
+            logged_loss = (
+                distributed_average(loss_meter, device)
+                if distributed
+                else loss_meter.avg
+            )
+
+            if is_main:
+                elapsed = time.time() - start_time
+                current_lr = optimizer.param_groups[0]["lr"]
+                logging.info(
+                    f"Epoch {epoch:02d} | step {global_step} | "
+                    f"loss {logged_loss:.4f} | lr {current_lr:.2e} | "
+                    f"{elapsed:.1f}s"
+                )
+                if use_wandb and wandb is not None:
+                    wandb.log(
+                        {
+                            "train/loss": logged_loss,
+                            "train/lr": current_lr,
+                            "train/epoch": epoch,
+                            "train/step": global_step,
+                        },
+                        step=global_step,
+                    )
+                start_time = time.time()
+
+        if on_step_end is not None:
+            on_step_end(global_step, loss_meter)
+
     for batch_idx, batch in enumerate(dataloader, start=1):
         if batch is None:
             continue
@@ -364,41 +418,11 @@ def train_one_epoch(
 
         if steps_in_accum == grad_accum_steps:
             _optimizer_step()
-
-            # 모든 rank에서 동일하게 진입해야 함
-            if global_step > 0 and global_step % log_interval == 0:
-                # 여기서는 각 rank가 모두 distributed_average를 호출
-                logged_loss = (
-                    distributed_average(loss_meter, device)
-                    if distributed
-                    else loss_meter.avg
-                )
-
-                if is_main:
-                    elapsed = time.time() - start_time
-                    current_lr = optimizer.param_groups[0]["lr"]
-                    logging.info(
-                        f"Epoch {epoch:02d} | step {global_step} | "
-                        f"loss {logged_loss:.4f} | lr {current_lr:.2e} | "
-                        f"{elapsed:.1f}s"
-                    )
-                    if use_wandb and wandb is not None:
-                        wandb.log(
-                            {
-                                "train/loss": logged_loss,
-                                "train/lr": current_lr,
-                                "train/epoch": epoch,
-                                "train/step": global_step,
-                            },
-                            step=global_step,
-                        )
-                    start_time = time.time()
-            # ★ step 종료 콜백 (모든 rank에서 동일하게 호출)
-            if on_step_end is not None:
-                on_step_end(global_step, loss_meter)
+            _after_optimizer_step()
 
     if steps_in_accum > 0:
         _optimizer_step()
+        _after_optimizer_step()
 
     if skipped_batches and (not distributed or rank == 0):
         logging.info(
@@ -629,6 +653,7 @@ def run_training(cfg: Dict) -> Dict:
     best_val = float("inf")
     best_path: Optional[Path] = None
     last_val_loss = float("inf")
+    performed_validation = False
 
 
     resume_path = cfg["trainer"].get("resume_from")
@@ -661,7 +686,7 @@ def run_training(cfg: Dict) -> Dict:
 
         # ★ epoch마다 새 on_step_end 콜백 정의 (epoch 캡처)
         def on_step_end(global_step_inner: int, loss_meter: AverageMeter):
-            nonlocal best_val, best_path, last_val_loss
+            nonlocal best_val, best_path, last_val_loss, performed_validation
 
             # 1) validation: 모든 rank에서 동일한 step에서 호출
             if val_every_steps and global_step_inner > 0 and global_step_inner % val_every_steps == 0:
@@ -674,6 +699,7 @@ def run_training(cfg: Dict) -> Dict:
                     distributed=is_distributed,
                     rank=rank,
                 )
+                performed_validation = True
                 last_val_loss = float(val_loss)
                 improved = val_loss < best_val
                 if improved:
@@ -715,6 +741,7 @@ def run_training(cfg: Dict) -> Dict:
                             ckpt_state,
                             cfg["trainer"]["checkpoint_dir"],
                             cfg["trainer"]["max_to_keep"],
+                            is_best=True,
                         )
                         logging.info(f"[VAL] New best checkpoint: {best_path}")
 
@@ -779,8 +806,65 @@ def run_training(cfg: Dict) -> Dict:
                     step=global_step,
                 )
 
+    # 최종 검증을 한 번 더 수행해 best checkpoint 보장
+    if valid_loader is not None:
+        final_val_loss = evaluate(
+            model=model,
+            dataloader=valid_loader,
+            criterion=criterion,
+            device=device,
+            amp_enabled=amp_enabled,
+            distributed=is_distributed,
+            rank=rank,
+        )
+        performed_validation = True
+        last_val_loss = float(final_val_loss)
+        improved = final_val_loss < best_val
+        if improved:
+            best_val = final_val_loss
+
+        if is_main_process:
+            logging.info(
+                f"[VAL][FINAL] step {global_step} | val loss {final_val_loss:.4f} | best {best_val:.4f}"
+            )
+            if use_wandb and wandb is not None:
+                wandb.log(
+                    {
+                        "val/loss_final": final_val_loss,
+                        "val/best": best_val,
+                        "val/step": global_step,
+                    },
+                    step=global_step,
+                )
+            if improved:
+                ckpt_state = {
+                    "epoch": cfg["trainer"]["num_epochs"],
+                    "global_step": global_step,
+                    "val_loss": float(final_val_loss),
+                    "best_val": float(best_val),
+                    "model_state": (
+                        model.module.state_dict()
+                        if isinstance(model, DDP)
+                        else model.state_dict()
+                    ),
+                    "optim_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "scaler_state": scaler.state_dict() if amp_enabled else None,
+                    "config": cfg,
+                }
+                best_path = save_checkpoint(
+                    ckpt_state,
+                    cfg["trainer"]["checkpoint_dir"],
+                    cfg["trainer"]["max_to_keep"],
+                    is_best=True,
+                )
+                logging.info(f"[VAL][FINAL] New best checkpoint: {best_path}")
+
     if use_wandb and wandb is not None and is_main_process:
         wandb.finish()
+
+    if not performed_validation and is_main_process:
+        logging.warning("Validation did not run; check val_steps or dataset setup.")
     return {
         "best_val_loss": best_val,
         "best_checkpoint": str(best_path) if best_path else None,

@@ -1,19 +1,20 @@
+from __future__ import annotations
 import logging
 import json
 import contextlib
 import random
 from typing import Dict, Any
 
-from deep.ref.SALMONN.models.utils import StoppingCriteriaSub
+from .utils import StoppingCriteriaSub
 import torch
 import torch.nn as nn
-from transformers import LlamaTokenizer, StoppingCriteriaList, LlamaForCausalLM
+from transformers import LlamaTokenizer, StoppingCriteriaList, LlamaForCausalLM, AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, TaskType, get_peft_model
-from __future__ import annotations
+
 
 # 기존: from conformer import Conformer  (❌ 현재 경로 구조와 안 맞음)
 # 수정: 같은 패키지(model) 안의 서브패키지에서 상대 import
-from .conformer.conformer.model import Conformer
+from .conformer.conformer.model import Conformer, ConformerEncoderOnly, load_encoder_from_checkpoint
 
 from .SpeechLlamaProj import SpeechLlamaProj
 
@@ -32,12 +33,12 @@ class modelYIM(nn.Module):
         conv_kernel_size: int,
         dropout: float,
         modelpath: str,
-    ) -> Conformer:
+    ) -> ConformerEncoderOnly:
         """
         config["model"]의 설정에 맞춰 Conformer encoder를 초기화.
         필요하다면 modelpath(=checkpoint)를 내부에서 로드하는 Conformer 구현이라고 가정.
         """
-        conformer = Conformer(
+        conformer = ConformerEncoderOnly(
             input_dim=input_dim,
             encoder_dim=encoder_dim,
             num_encoder_layers=num_encoder_layers,
@@ -49,9 +50,9 @@ class modelYIM(nn.Module):
             feed_forward_dropout_p=dropout,
             attention_dropout_p=dropout,
             conv_dropout_p=dropout,
-            modelpath=modelpath,  # 네가 만든 Conformer 래퍼가 이 인자를 받는다고 가정
-        ).to(self.device)
-
+        )
+        load_encoder_from_checkpoint(
+            checkpoint_path=modelpath, model=conformer)
         return conformer
 
     
@@ -124,13 +125,16 @@ class modelYIM(nn.Module):
         self.train_llama = train_llama
         self.max_txt_len = max_txt_len
 
-        logging.info('Loading LLaMA Tokenizer')
-        self.llama_tokenizer = LlamaTokenizer.from_pretrained(llama_path, use_fast=False)
+        if not llama_path:
+            raise ValueError("The 'llama_path' in config.yaml is empty. Please specify the path to your LLaMA model (e.g., 'meta-llama/Llama-2-7b-hf' or a local path).")
+
+        logging.info(f'Loading LLaMA Tokenizer from {llama_path}')
+        self.llama_tokenizer = AutoTokenizer.from_pretrained(llama_path, use_fast=False)
         self.llama_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.llama_tokenizer.padding_side = "right"
 
         logging.info('Loading LLaMA Model')
-        self.llama_model = LlamaForCausalLM.from_pretrained(
+        self.llama_model = AutoModelForCausalLM.from_pretrained(
             llama_path,
             torch_dtype=torch.float16,
         )
@@ -204,8 +208,15 @@ class modelYIM(nn.Module):
         #       "input_features":      [B, T_max, F]
         #       "input_input_lengths": [B]
         # ------------------------------------------------------------------
+        """
+            "input_features": feats,  # [T_i, F]
+            "feature_length": feat_len,
+            "text": text_value,
+            "utt_id": utt_id,
+        }
+        """
         features = samples["input_features"]          # [B, T_max, F]
-        input_lengths = samples["input_input_lengths"]  # [B]
+        input_lengths = samples["feature_length"]  # [B]
         texts = samples["text"]                      # List[str]
 
         # 디바이스 정렬 (prepare_sample에서 이미 옮겼다면 중복될 수 있음)

@@ -30,6 +30,10 @@ class Runner:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.log_writter = SummaryWriter(self.output_dir)
 
+        # model storage path
+        self.model_storage_path = Path(self.run_cfg.get("model_storage_path", "./model_storage"))
+        self.model_storage_path.mkdir(parents=True, exist_ok=True)
+
         # settings
         self.device = torch.device(self.run_cfg.get("device", cfg.get("device", "cuda")))
         self.use_distributed = bool(self.run_cfg.get("use_distributed", False))
@@ -191,6 +195,7 @@ class Runner:
 
         metric_logger = MetricLogger(delimiter="  ")
         header = "Eval: data epoch: [{}]".format(epoch)
+        log_freq = int(self.run_cfg.get("log_freq", 50))
 
         results = []
         for samples in metric_logger.log_every(dataloader, log_freq, header=header):
@@ -301,6 +306,7 @@ class Runner:
     def train(self):
         start_time = time.time()
         best_agg_metric = 0.0
+        best_val_loss = float('inf')
         best_epoch = 0
 
         for cur_epoch in range(self.start_epoch, self.max_epoch):
@@ -315,17 +321,28 @@ class Runner:
             # validating phase
             logging.info("Validating Phase")
             valid_log = self.valid_epoch(cur_epoch, "valid", decode=False, save_json=False)
+            
+            val_loss = None
             if valid_log is not None and is_main_process():
                 agg_metrics = valid_log["agg_metrics"]
+                val_loss = valid_log["loss"]
+                
+                # Save best model based on validation loss
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_epoch = cur_epoch
+                    self.save_checkpoint(cur_epoch, is_best=True, val_loss=val_loss)
+                
+                # Also save if it's the best metric (optional, keeping existing logic)
                 if agg_metrics > best_agg_metric:
                     best_agg_metric = agg_metrics
-                    best_epoch = cur_epoch
-                    self.save_checkpoint(cur_epoch, is_best=True)
+                    # self.save_checkpoint(cur_epoch, is_best=True) # Already saved if loss is best, or we can save separately
 
-                valid_log.update({"best_epoch": best_epoch})
+                valid_log.update({"best_epoch": best_epoch, "best_val_loss": best_val_loss})
                 self.log_stats(valid_log, split_name="valid")
 
-            self.save_checkpoint(cur_epoch, is_best=False)
+            # Save periodic checkpoint
+            self.save_checkpoint(cur_epoch, is_best=False, val_loss=val_loss)
 
             if self.use_distributed:
                 dist.barrier()
@@ -350,7 +367,7 @@ class Runner:
             pass
 
     @main_process
-    def save_checkpoint(self, cur_epoch, is_best: bool = False):
+    def save_checkpoint(self, cur_epoch, is_best: bool = False, val_loss: float = None):
         model_no_ddp = self.unwrap_dist_model(self.model)
         param_grad_dic = {k: v.requires_grad for (k, v) in model_no_ddp.named_parameters()}
         state_dict = model_no_ddp.state_dict()
@@ -363,8 +380,25 @@ class Runner:
             "config": self.config,
             "scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "epoch": cur_epoch,
+            "val_loss": val_loss
         }
+        
+        # 1. Save to original output_dir (keep existing behavior)
         fname = "checkpoint_{}.pth".format("best" if is_best else cur_epoch)
         save_to = os.path.join(self.output_dir, fname)
         logging.info("Saving checkpoint at epoch {} to {}.".format(cur_epoch, save_to))
         torch.save(save_obj, save_to)
+
+        # 2. Save to model_storage_path with custom name
+        # Format: {experiment_name}_epoch{epoch}_loss{val_loss}.pth
+        exp_name = self.config.get("experiment_name", "model")
+        loss_str = f"{val_loss:.4f}" if val_loss is not None else "nan"
+        
+        if is_best:
+            storage_fname = f"{exp_name}_best_loss{loss_str}.pth"
+        else:
+            storage_fname = f"{exp_name}_epoch{cur_epoch:02d}_loss{loss_str}.pth"
+            
+        storage_save_to = self.model_storage_path / storage_fname
+        logging.info("Saving storage checkpoint to {}.".format(storage_save_to))
+        torch.save(save_obj, storage_save_to)

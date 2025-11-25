@@ -55,39 +55,53 @@ def is_main_process():
 
 
 def init_distributed_mode(args):
+    def get_arg(key, default=None):
+        if isinstance(args, dict):
+            return args.get(key, default)
+        return getattr(args, key, default)
+
+    def set_arg(key, value):
+        if isinstance(args, dict):
+            args[key] = value
+        else:
+            setattr(args, key, value)
+
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ["WORLD_SIZE"])
-        args.gpu = int(os.environ["LOCAL_RANK"])
+        set_arg("rank", int(os.environ["RANK"]))
+        set_arg("world_size", int(os.environ["WORLD_SIZE"]))
+        set_arg("gpu", int(os.environ["LOCAL_RANK"]))
     elif "SLURM_PROCID" in os.environ:
-        args.rank = int(os.environ["SLURM_PROCID"])
-        args.gpu = args.rank % torch.cuda.device_count()
+        set_arg("rank", int(os.environ["SLURM_PROCID"]))
+        set_arg("gpu", get_arg("rank") % torch.cuda.device_count())
     else:
         print("Not using distributed mode")
-        args.use_distributed = False
+        set_arg("use_distributed", False)
         return
 
-    args.use_distributed = True
+    set_arg("use_distributed", True)
 
-    torch.cuda.set_device(args.gpu)
-    args.dist_backend = "nccl"
+    torch.cuda.set_device(get_arg("gpu"))
+    set_arg("dist_backend", "nccl")
+    
+    dist_url = get_arg("dist_url", "env://")
+
     print(
         "| distributed init (rank {}, world {}): {}".format(
-            args.rank, args.world_size, args.dist_url
+            get_arg("rank"), get_arg("world_size"), dist_url
         ),
         flush=True,
     )
     torch.distributed.init_process_group(
-        backend=args.dist_backend,
-        init_method=args.dist_url,
-        world_size=args.world_size,
-        rank=args.rank,
+        backend=get_arg("dist_backend"),
+        init_method=dist_url,
+        world_size=get_arg("world_size"),
+        rank=get_arg("rank"),
         timeout=datetime.timedelta(
             days=365
         ),  # allow auto-downloading and de-compressing
     )
     torch.distributed.barrier()
-    setup_for_distributed(args.rank == 0)
+    setup_for_distributed(get_arg("rank") == 0)
 
 
 def get_dist_info():

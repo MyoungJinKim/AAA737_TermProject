@@ -66,12 +66,18 @@ class LogMelFeatureExtractor(nn.Module):
         # [1, n_mels, time]
         mel = self.melspec(waveform)
 
-        # log-mel
+        # log-mel 변환
+        #  - mel 값이 0 또는 매우 작은 값이면 log에서 -inf가 나올 수 있으므로
+        #    clamp_min_으로 하한을 log_offset 이상으로 올린 후 log_를 in-place로 적용
         mel = mel.clamp_min_(self.log_offset).log_()
 
-        # 시간 축 기준 CMVN
+        # 시간 축에 대한 평균/표준편차 정규화 (CMVN 비슷한 개념)
+        #   현재 shape: [1, n_mels, time]
+        #   dim=-1 기준: time 방향으로 평균/표준편차를 계산
         mel_mean = mel.mean(dim=-1, keepdim=True)
         mel_std = mel.std(dim=-1, keepdim=True)
+
+        # (x - mean) / (std + eps)
         mel = (mel - mel_mean) / (mel_std + 1e-5)
 
         # [1, n_mels, T] → [1, T, n_mels] → [T, n_mels]

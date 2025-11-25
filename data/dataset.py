@@ -47,7 +47,7 @@ class HuggingFaceSpeechDataset(Dataset):
         # 컬럼 이름 설정
         self.audio_column = dataset_cfg.get("audio_column", "audio")
         # 기본 텍스트 컬럼 후보: 'text' → 없으면 'transcript' 로 fallback
-        self.text_column = dataset_cfg.get("text_column", "text")
+        self.text_column = dataset_cfg.get("text_column", "transcript")
 
         # duration (길이 고정/패딩) 설정
         self.target_seconds = target_seconds
@@ -68,8 +68,7 @@ class HuggingFaceSpeechDataset(Dataset):
             else load_dataset(self.dataset_name, **load_kwargs)
         )
 
-        # 오디오 컬럼을 지정한 sample_rate 로 캐스팅
-        # ds = ds.cast_column(self.audio_column, Audio(sampling_rate=self.sample_rate))
+        # 버전 때문에 어쩔 수 없음 
         ds = ds.cast_column(self.audio_column, Audio(decode=False))
 
         col_names = list(ds.column_names)
