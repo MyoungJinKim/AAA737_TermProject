@@ -122,6 +122,12 @@ run:
   model_storage_path: "/data_x/aa007878/deep/myung/model/model_storage"
   evaluate: False # if True, only evaluate model on test data
 
+  wandb:
+    enable: true
+    project: "conformer-stage2"
+    entity: null
+    run_name: "layer_8_batch_32_{modelpath}"
+
   log_freq: 5
   epoch_based: False
   iters_per_epoch: 3000

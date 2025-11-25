@@ -124,7 +124,7 @@ config: Dict = {
         "weight_decay": 1e-4,
         "eps": 1e-9,
         "betas": (0.9, 0.98),
-        "grad_accum_steps": 4,
+        "grad_accum_steps": 1,
     },
     "scheduler": {
         "warmup_steps": 30000,
@@ -144,7 +144,7 @@ config: Dict = {
         "ckpt_steps": 5000,     # ★ 5000 step마다 checkpoint 저장
         "grad_clip": 5.0,
         "use_amp": True,
-        "checkpoint_dir": "checkpoints/stage1_ctc_layer12_batch32",
+        "checkpoint_dir": "checkpoints/stage1_ctc_layer12_batch32_2",
         "max_to_keep": 5,
         "resume_from": None,
     },
@@ -152,7 +152,7 @@ config: Dict = {
         "enable": True,
         "project": "conformer-stage1-ctc",
         "entity": None,       # 필요하면 본인 entity로 설정
-        "run_name": "layer_12_batch_32_warmup30k",     # None이면 자동 이름
+        "run_name": "layer_12_batch_32_warmup30k_2",     # None이면 자동 이름
     },
 }
 

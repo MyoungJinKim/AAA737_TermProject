@@ -1,4 +1,15 @@
 import random
+"""
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export TOKENIZERS_PARALLELISM=false  # 선택
+export NCCL_P2P_DISABLE=1
+
+torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  train.py
+
+"""
 
 import numpy as np
 import torch
@@ -13,7 +24,7 @@ import yaml
 from pathlib import Path
 from data.dataloader import build_dataset, build_dataloader
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"
 CONFIG_PATH = Path("/data_x/aa007878/deep/myung/configs/config.yaml")
 
 

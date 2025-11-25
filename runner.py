@@ -6,6 +6,7 @@ import time
 import datetime
 from pathlib import Path
 import logging
+import wandb
 
 import torch
 import torch.distributed as dist
@@ -33,6 +34,29 @@ class Runner:
         # model storage path
         self.model_storage_path = Path(self.run_cfg.get("model_storage_path", "./model_storage"))
         self.model_storage_path.mkdir(parents=True, exist_ok=True)
+
+        # wandb
+        self.wandb_cfg = self.run_cfg.get("wandb", {})
+        self.use_wandb = self.wandb_cfg.get("enable", False) and is_main_process()
+        
+        if self.use_wandb:
+            project = self.wandb_cfg.get("project", "conformer-stage2")
+            entity = self.wandb_cfg.get("entity", None)
+            run_name = self.wandb_cfg.get("run_name", None)
+            
+            if run_name and "{modelpath}" in run_name:
+                llama_path = cfg.get("model", {}).get("llama_path", "")
+                # Extract model name from path (e.g. "meta-llama/Llama-3.2-3B-Instruct" -> "Llama-3.2-3B-Instruct")
+                model_name = os.path.basename(llama_path) if llama_path else "unknown"
+                run_name = run_name.format(modelpath=model_name)
+            
+            wandb.init(
+                project=project,
+                entity=entity,
+                name=run_name,
+                config=cfg,
+                dir=str(self.output_dir)
+            )
 
         # settings
         self.device = torch.device(self.run_cfg.get("device", cfg.get("device", "cuda")))
@@ -170,6 +194,14 @@ class Runner:
             metric_logger.update(loss=loss.item())
             # optimizer의 첫 번째 param group에서 현재 lr 추출
             metric_logger.update(lr=self.optimizer.param_groups[0]["lr"])
+
+            if self.use_wandb and (i % log_freq == 0 or i == self.iters_per_epoch - 1):
+                 wandb.log({
+                    "train/loss": loss.item(),
+                    "train/lr": self.optimizer.param_groups[0]["lr"],
+                    "train/epoch": epoch,
+                    "train/step": epoch * self.iters_per_epoch + i
+                 })
 
         # 4. (분산 학습 시) 모든 프로세스 사이의 metric을 동기화
         metric_logger.synchronize_between_processes()
@@ -340,6 +372,15 @@ class Runner:
 
                 valid_log.update({"best_epoch": best_epoch, "best_val_loss": best_val_loss})
                 self.log_stats(valid_log, split_name="valid")
+
+                if self.use_wandb:
+                     wandb.log({
+                        "valid/loss": valid_log["loss"],
+                        "valid/agg_metrics": valid_log.get("agg_metrics", 0),
+                        "valid/best_epoch": best_epoch,
+                        "valid/best_val_loss": best_val_loss,
+                        "epoch": cur_epoch
+                     })
 
             # Save periodic checkpoint
             self.save_checkpoint(cur_epoch, is_best=False, val_loss=val_loss)

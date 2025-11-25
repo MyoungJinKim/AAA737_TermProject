@@ -129,15 +129,15 @@ def get_optimizer(model, config):
     optim_params = [
         {
             "params": p_wd,
-            "weight_decay": float(config.weight_decay),
+            "weight_decay": float(config.get("weight_decay", 0.05)),
         },
         {"params": p_non_wd, "weight_decay": 0},
     ]
     beta2 = config.get("beta2", 0.999)
     optimizer = torch.optim.AdamW(
         optim_params,
-        lr=float(config.init_lr),
-        weight_decay=float(config.weight_decay),
+        lr=float(config.get("init_lr", 1e-4)),
+        weight_decay=float(config.get("weight_decay", 0.05)),
         betas=(0.9, beta2),
     )
 
