@@ -32,6 +32,21 @@ torchrun --nproc_per_node=4 train.py
 
 스크립트는 기본적으로 GPU 0, 1, 2, 3번을 사용하도록 설정되어 있습니다 (`os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"`).
 
+### 4. 추론 실행 (Inference)
+학습된 모델 체크포인트를 사용하여 오디오 파일을 텍스트로 변환(추론)할 수 있습니다.
+
+```bash
+python inference.py \
+  --config configs/config.yaml \
+  --checkpoint /data_x/aa007878/deep/myung/model/model_storage/stage2_best_lossX.XXXX.pth \
+  --audio_path /path/to/your/audio.wav
+```
+
+*   `--config`: 학습에 사용한 설정 파일 경로 (기본값: `configs/config.yaml`)
+*   `--checkpoint`: 학습된 모델 체크포인트 파일 경로 (`.pth`)
+    *   학습 중 `model/model_storage/` 폴더에 저장된 파일을 사용하세요.
+*   `--audio_path`: 변환할 오디오 파일 경로 (`.wav`)
+
 ## 코드 설명 (Code Description)
 
 ### `train.py`
