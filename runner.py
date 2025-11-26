@@ -196,16 +196,15 @@ class Runner:
             # optimizer의 첫 번째 param group에서 현재 lr 추출
             metric_logger.update(lr=self.optimizer.param_groups[0]["lr"])
 
+            global_step = epoch * self.iters_per_epoch + i
             if self.use_wandb and (i % log_freq == 0 or i == self.iters_per_epoch - 1):
                  wandb.log({
                     "train/loss": loss.item(),
                     "train/lr": self.optimizer.param_groups[0]["lr"],
                     "train/epoch": epoch + i / self.iters_per_epoch,
-                    "train/step": epoch * self.iters_per_epoch + i
-                 })
+                 }, step=global_step)
 
             # Step-based Validation
-            global_step = epoch * self.iters_per_epoch + i
             if self.val_step_interval > 0 and (global_step + 1) % self.val_step_interval == 0:
                 self.validate_and_save(epoch, step=global_step + 1)
                 # Validation 후 다시 train 모드로 복귀
@@ -248,12 +247,16 @@ class Runner:
             correct = forward_result.get("correct", torch.tensor(0.0, device=self.device))
             total = forward_result.get("total", torch.tensor(1.0, device=self.device))
 
+            loss_val = loss.item() if isinstance(loss, torch.Tensor) else loss
+            total_val = total.item() if isinstance(total, torch.Tensor) else total
+            correct_val = correct.item() if isinstance(correct, torch.Tensor) else correct
+
             # ground truth text는 List[str]일 가능성이 높으므로 그대로 저장
             res = {
                 "ground_truth": samples.get("text", []),
-                "loss": float(loss.item()),
-                "acc": float((correct / total).item()),
-                "total": int(total.item()),
+                "loss": float(loss_val),
+                "acc": float(correct_val / total_val) if total_val > 0 else 0.0,
+                "total": int(total_val),
             }
 
             if decode:
@@ -376,11 +379,14 @@ class Runner:
                     "valid/agg_metrics": valid_log.get("agg_metrics", 0),
                     "valid/best_epoch": self.best_epoch,
                     "valid/best_val_loss": self.best_val_loss,
-                    "epoch": epoch_val
+                    "train/epoch": epoch_val
                 }
-                if step is not None:
-                    log_dict["valid/step"] = step
-                wandb.log(log_dict)
+                
+                log_step = step
+                if log_step is None:
+                    log_step = (cur_epoch + 1) * self.iters_per_epoch
+                
+                wandb.log(log_dict, step=log_step)
 
         # Save periodic checkpoint (epoch 단위일 때만 저장하거나, step 단위로도 저장하고 싶으면 여기서 처리)
         # 여기서는 step 단위 validation일 때는 best만 저장하고, epoch 끝날 때 periodic 저장하도록 유지

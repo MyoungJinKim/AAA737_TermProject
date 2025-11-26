@@ -1,6 +1,6 @@
 import random
 """
-export CUDA_VISIBLE_DEVICES=0,1,4,6
+export CUDA_VISIBLE_DEVICES=0,1,2,3  # 사용할 GPU 설정
 export TOKENIZERS_PARALLELISM=false  # 선택
 export NCCL_P2P_DISABLE=1
 

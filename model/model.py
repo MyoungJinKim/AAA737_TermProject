@@ -350,7 +350,8 @@ class modelYIM(nn.Module):
             # logits에서 [bos+speech] 구간을 건너뛰고 텍스트 구간만 가져오기
             offset = empty_targets.size(1)  # bos+speech length
             # 텍스트 위치의 logits: [B, T_txt, V]
-            text_logits = outputs.logits[:, offset:-1, :]  # shift 한 칸 고려 (마지막 토큰 예측은 실제 라벨 없음)
+            # offset-1 부터 시작해야 첫 번째 텍스트 토큰에 대한 예측(마지막 스피치 토큰의 출력)을 포함함
+            text_logits = outputs.logits[:, offset-1:-1, :]  # shift 한 칸 고려 (마지막 토큰 예측은 실제 라벨 없음)
             pred_ids = text_logits.contiguous().view(-1, nvocab).argmax(dim=-1)
 
             labels = targets_full[:, offset:].contiguous().view(-1)

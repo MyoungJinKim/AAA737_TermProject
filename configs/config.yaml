@@ -21,7 +21,7 @@ device: "cuda"   # train.py에서 필요하면 torch.cuda.is_available()로 재�
 
 data:
   sample_rate: 16000
-  text_lowercase: true
+  # text_lowercase: true
   max_audio_seconds: 20.0
   pad_to_max_seconds: true
   hf_dataset:
@@ -47,8 +47,8 @@ feature_extractor:
 
 
 dataloader:
-  batch_size: 4
-  num_workers: 4
+  batch_size: 32
+  num_workers: 32
   pin_memory: true
   prefetch_factor: 2
   persistent_workers: false
@@ -56,26 +56,26 @@ dataloader:
   # 필요하면 encoder stride에 맞춰 패딩 배수를 맞출 수 있음 (예: 8)
   pad_to_multiple_of: 8
 
-optim:
-  peak_lr: 1.0e-3
-  weight_decay: 1.0e-4
-  eps: 1.0e-9
-  betas: [0.9, 0.98]
-  grad_accum_steps: 4
+# optim:
+#   peak_lr: 1.0e-3
+#   weight_decay: 1.0e-4
+#   eps: 1.0e-9
+#   betas: [0.9, 0.98]
+#   grad_accum_steps: 4
 
-scheduler:
-  warmup_steps: 20000
-  total_steps: 250000
-  final_lr_scale: 0.01
+# scheduler:
+#   warmup_steps: 20000
+#   total_steps: 250000
+#   final_lr_scale: 0.01
 
-trainer:
-  num_epochs: 30
-  log_interval: 50
-  val_interval: 1
-  grad_clip: 5.0
-  use_amp: true
-  max_to_keep: 5
-  resume_from: null   # 이어서 학습할 체크포인트 경로 (없으면 null)
+# trainer:
+#   num_epochs: 30
+#   log_interval: 50
+#   val_interval: 1
+#   grad_clip: 5.0
+#   use_amp: true
+#   max_to_keep: 5
+#   resume_from: null   # 이어서 학습할 체크포인트 경로 (없으면 null)
 
 #########################
 # LLaMA / Conformer 연결
@@ -85,11 +85,11 @@ model:
   llama_path: "meta-llama/Llama-3.2-1B-Instruct"  # 예: "meta-llama/Meta-Llama-3-8B-Instruct" 또는 "/data_x/.../llama"
 
   # stage1 / 사전학습된 Conformer checkpoint 경로
-  conformer_path: "/data_x/aa007878/deep/myung/model/conformer/conformer_model/conformer_stage1.pt"  # 예: "/data_x/aa007878/deep/myung/checkpoints/stage1/epochxx_....pt"
+  conformer_path: "/data_x/aa007878/deep/myung/model/conformer/conformer_model/conformer_stage1_layer12.pt"  # 예: "/data_x/aa007878/deep/myung/checkpoints/stage1/epochxx_....pt"
 
   # 오디오 인코더(Conformer) 구조 관련 파라미터
   conformer_dim: 512              # Conformer encoder 출력 차원 (LLM projection 입력 차원)
-  conformer_layers: 8            # 사용할 encoder 레이어 수 (stage2에서 상단 몇 개만 쓴다면 여기에 맞춰 조정)
+  conformer_layers: 12            # 사용할 encoder 레이어 수 (stage2에서 상단 몇 개만 쓴다면 여기에 맞춰 조정)
   conformer_input_dim: 80         # Mel feature dim (n_mels와 동일)
   conformer_concat_num: 3         # 시간 축 stacking 개수 (예: 3 프레임 concat → 3 * 80 차원 등)
   feed_forward_expansion_factor: 4
@@ -117,7 +117,7 @@ model:
 
 run:
   # log & settings
-  seed: 42
+  # seed: 42
   output_dir: "output directory"
   model_storage_path: "/data_x/aa007878/deep/myung/model/model_storage"
   evaluate: False # if True, only evaluate model on test data
@@ -128,14 +128,14 @@ run:
     entity: null
     run_name: "layer_8_batch_32_{modelpath}"
 
-  log_freq: 5
+  log_freq: 50
   epoch_based: True
   # iters_per_epoch: 3000
   accum_grad_iters: 1
   val_step_interval: 1000  # 1000 스텝마다 validation 수행 (0이면 epoch 단위로만 수행)
-  batch_size_train: 8
-  batch_size_eval: 8
-  num_workers: 8
+  # batch_size_train: 32
+  # batch_size_eval: 32
+  # num_workers: 32
 
   device: "cuda"
   use_distributed: True
@@ -146,7 +146,7 @@ run:
   # optimizer & scheduler
   optims:
     max_epoch: 30
-    warmup_steps: 1000
+    warmup_steps: 8000
     warmup_start_lr: 1e-6
     init_lr: 1e-4
     min_lr: 1e-5
