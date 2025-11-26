@@ -47,6 +47,26 @@ python inference.py \
     *   학습 중 `model/model_storage/` 폴더에 저장된 파일을 사용하세요.
 *   `--audio_path`: 변환할 오디오 파일 경로 (`.wav`)
 
+### 5. 평가 실행 (Evaluation)
+학습된 모델의 성능을 테스트 데이터셋으로 평가하고 WER(Word Error Rate)을 계산할 수 있습니다.
+
+```bash
+python evalutate.py \
+  --config configs/evaluate_config.yaml \
+  --ckpt {체크포인트 경로}
+```
+
+*   `--config`: 평가 설정 파일 경로 (기본값: `configs/evaluate_config.yaml`)
+    *   평가에 사용할 데이터셋, 생성 파라미터 등을 설정합니다.
+*   `--ckpt`: 평가할 모델 체크포인트 파일 경로 (`.pth`, 선택사항)
+    *   지정하지 않으면 설정 파일의 `run.eval_checkpoint` 값을 사용합니다.
+    *   학습 중 `model/model_storage/` 폴더에 저장된 파일을 사용하세요.
+
+**평가 결과:**
+*   터미널에는 최종 평균 WER만 출력됩니다.
+*   상세한 평가 결과(각 샘플별 정답, 모델 출력, WER)는 `outputs/evaluation_{체크포인트명}_{타임스탬프}.txt` 파일에 저장됩니다.
+*   결과 파일에는 개별 샘플 결과와 전체 평균 WER이 모두 포함됩니다.
+
 ## 코드 설명 (Code Description)
 
 ### `train.py`
@@ -68,3 +88,22 @@ python inference.py \
 
 5.  **학습 실행 (`Runner`)**:
     *   `Runner` 클래스를 초기화하고 `runner.train()`을 호출하여 실제 학습 루프를 시작합니다.
+
+### `evalutate.py`
+모델 평가를 수행하는 스크립트입니다. 주요 기능은 다음과 같습니다:
+
+1.  **설정 및 체크포인트 로드**:
+    *   평가 설정 파일(`configs/evaluate_config.yaml`)을 읽어와 평가 파라미터를 로드합니다.
+    *   학습된 모델 체크포인트를 로드하여 평가에 사용합니다.
+
+2.  **데이터셋 준비**:
+    *   설정 파일에 지정된 테스트/검증 데이터셋을 로드합니다.
+    *   HuggingFace 데이터셋을 사용하여 평가 데이터를 준비합니다.
+
+3.  **모델 추론 및 WER 계산**:
+    *   각 샘플에 대해 모델이 생성한 텍스트와 정답 텍스트를 비교합니다.
+    *   HuggingFace `evaluate` 라이브러리를 사용하여 WER(Word Error Rate)을 계산합니다.
+
+4.  **결과 저장**:
+    *   개별 샘플별 상세 결과(정답, 모델 출력, WER)를 파일로 저장합니다.
+    *   터미널에는 최종 평균 WER만 출력하여 가독성을 높입니다.
