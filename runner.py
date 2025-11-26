@@ -66,6 +66,7 @@ class Runner:
         self.max_epoch = int(opt_cfg.get("max_epoch", 10))
         self.evaluate_only = bool(self.run_cfg.get("evaluate", False))
         self.cuda_enabled = (self.device.type == "cuda")
+        self.val_step_interval = int(self.run_cfg.get("val_step_interval", 0))
 
         # model / DDP
         self._model = model.to(self.device)
@@ -97,10 +98,10 @@ class Runner:
             self.optimizer,
             max_epoch=self.max_epoch,
             iters_per_epoch=self.iters_per_epoch,
-            min_lr=opt_cfg.get("min_lr", 0.0),
-            init_lr=opt_cfg.get("init_lr", opt_cfg.get("peak_lr", 1e-3)),
-            warmup_steps=opt_cfg.get("warmup_steps", 0),
-            warmup_start_lr=opt_cfg.get("warmup_start_lr", -1),
+            min_lr=float(opt_cfg.get("min_lr", 0.0)),
+            init_lr=float(opt_cfg.get("init_lr", opt_cfg.get("peak_lr", 1e-3))),
+            warmup_steps=int(opt_cfg.get("warmup_steps", 0)),
+            warmup_start_lr=float(opt_cfg.get("warmup_start_lr", -1)),
         )
 
         self.log_config()
@@ -199,9 +200,16 @@ class Runner:
                  wandb.log({
                     "train/loss": loss.item(),
                     "train/lr": self.optimizer.param_groups[0]["lr"],
-                    "train/epoch": epoch,
+                    "train/epoch": epoch + i / self.iters_per_epoch,
                     "train/step": epoch * self.iters_per_epoch + i
                  })
+
+            # Step-based Validation
+            global_step = epoch * self.iters_per_epoch + i
+            if self.val_step_interval > 0 and (global_step + 1) % self.val_step_interval == 0:
+                self.validate_and_save(epoch, step=global_step + 1)
+                # Validation 후 다시 train 모드로 복귀
+                self.model.train()
 
         # 4. (분산 학습 시) 모든 프로세스 사이의 metric을 동기화
         metric_logger.synchronize_between_processes()
@@ -335,11 +343,58 @@ class Runner:
 
             print("result file saved to %s" % final_result_file)
 
+    def validate_and_save(self, cur_epoch, step=None):
+        """
+        Validation을 수행하고 결과를 로깅 및 저장하는 헬퍼 함수.
+        step이 None이면 epoch 단위 validation으로 간주.
+        """
+        logging.info(f"Validating Phase (Epoch {cur_epoch}, Step {step})")
+        valid_log = self.valid_epoch(cur_epoch, "valid", decode=False, save_json=False)
+        
+        val_loss = None
+        if valid_log is not None and is_main_process():
+            agg_metrics = valid_log["agg_metrics"]
+            val_loss = valid_log["loss"]
+            
+            # Save best model based on validation loss
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.best_epoch = cur_epoch
+                self.save_checkpoint(cur_epoch, is_best=True, val_loss=val_loss)
+            
+            # Also save if it's the best metric (optional)
+            if agg_metrics > self.best_agg_metric:
+                self.best_agg_metric = agg_metrics
+
+            valid_log.update({"best_epoch": self.best_epoch, "best_val_loss": self.best_val_loss})
+            self.log_stats(valid_log, split_name="valid")
+
+            if self.use_wandb:
+                epoch_val = cur_epoch + 1 if step is None else step / self.iters_per_epoch
+                log_dict = {
+                    "valid/loss": valid_log["loss"],
+                    "valid/agg_metrics": valid_log.get("agg_metrics", 0),
+                    "valid/best_epoch": self.best_epoch,
+                    "valid/best_val_loss": self.best_val_loss,
+                    "epoch": epoch_val
+                }
+                if step is not None:
+                    log_dict["valid/step"] = step
+                wandb.log(log_dict)
+
+        # Save periodic checkpoint (epoch 단위일 때만 저장하거나, step 단위로도 저장하고 싶으면 여기서 처리)
+        # 여기서는 step 단위 validation일 때는 best만 저장하고, epoch 끝날 때 periodic 저장하도록 유지
+        if step is None:
+            self.save_checkpoint(cur_epoch, is_best=False, val_loss=val_loss)
+
+        if self.use_distributed:
+            dist.barrier()
+
     def train(self):
         start_time = time.time()
-        best_agg_metric = 0.0
-        best_val_loss = float('inf')
-        best_epoch = 0
+        self.best_agg_metric = 0.0
+        self.best_val_loss = float('inf')
+        self.best_epoch = 0
 
         for cur_epoch in range(self.start_epoch, self.max_epoch):
             if self.evaluate_only:
@@ -350,44 +405,9 @@ class Runner:
             train_stats = self.train_epoch(cur_epoch)
             self.log_stats(train_stats, split_name="train")
 
-            # validating phase
-            logging.info("Validating Phase")
-            valid_log = self.valid_epoch(cur_epoch, "valid", decode=False, save_json=False)
-            
-            val_loss = None
-            if valid_log is not None and is_main_process():
-                agg_metrics = valid_log["agg_metrics"]
-                val_loss = valid_log["loss"]
-                
-                # Save best model based on validation loss
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_epoch = cur_epoch
-                    self.save_checkpoint(cur_epoch, is_best=True, val_loss=val_loss)
-                
-                # Also save if it's the best metric (optional, keeping existing logic)
-                if agg_metrics > best_agg_metric:
-                    best_agg_metric = agg_metrics
-                    # self.save_checkpoint(cur_epoch, is_best=True) # Already saved if loss is best, or we can save separately
-
-                valid_log.update({"best_epoch": best_epoch, "best_val_loss": best_val_loss})
-                self.log_stats(valid_log, split_name="valid")
-
-                if self.use_wandb:
-                     wandb.log({
-                        "valid/loss": valid_log["loss"],
-                        "valid/agg_metrics": valid_log.get("agg_metrics", 0),
-                        "valid/best_epoch": best_epoch,
-                        "valid/best_val_loss": best_val_loss,
-                        "epoch": cur_epoch
-                     })
-
-            # Save periodic checkpoint
-            self.save_checkpoint(cur_epoch, is_best=False, val_loss=val_loss)
-
-            if self.use_distributed:
-                dist.barrier()
-
+            # validating phase (Epoch 단위)
+            # step 단위 validation을 하더라도 epoch 끝날 때 한 번 더 확실하게 수행
+            self.validate_and_save(cur_epoch, step=None)
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))

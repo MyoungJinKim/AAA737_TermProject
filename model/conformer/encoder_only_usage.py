@@ -1,8 +1,8 @@
 """Example utilities for running the encoder-only Conformer."""
 """
 python encoder_only_usage.py \
-  --checkpoint /data_x/aa007878/deep/myung/conformer/train/checkpoints/stage1_layer8_batch_256/epoch01_val1.5534.pt \
-  --output /data_x/aa007878/deep/myung/model/conformer/conformer_model/conformer_stage1.pt
+  --checkpoint /data_x/aa007878/deep/myung/conformer/train/checkpoints/stage1_ctc_layer12_batch32_2/epoch01_val1.2234.pt \
+  --output /data_x/aa007878/deep/myung/model/conformer/conformer_model/conformer_stage1_layer12.pt
 """
 import argparse
 from pathlib import Path

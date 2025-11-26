@@ -52,11 +52,11 @@ tb_logs/
 ########################
 # 모델 체크포인트 / 큰 바이너리
 ########################
-checkpoints/
-ckpt/
-*.pt
-*.pth
-*.bin
+# checkpoints/
+# ckpt/
+# *.pt
+# *.pth
+# *.bin
 
 ########################
 # HuggingFace / dataset cache

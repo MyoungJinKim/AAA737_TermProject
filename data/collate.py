@@ -89,7 +89,7 @@ class SpeechDataCollator:
         # model.forward에서 바로 unpack 할 수 있도록 dict 형태로 반환
         return {
             "input_features": features,        # [B, T_max, F]
-            "input_input_lengths": input_lengths,  # [B]
+            "feature_length": input_lengths,  # [B]
             "text": texts,                     # 길이 B 리스트
             "utt_id": utt_ids,                # 디버깅/로깅용
         }

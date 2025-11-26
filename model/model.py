@@ -183,7 +183,7 @@ class modelYIM(nn.Module):
             dropout=dropout,
         )
         # Conformer 출력에 대해 layer norm 적용 (차원: conformer_dim)
-        self.ln_speech = nn.LayerNorm(conformer_dim)
+        # self.ln_speech = nn.LayerNorm(conformer_dim)
 
     
         logging.info('Loading speech LLAMA proj')
@@ -210,7 +210,7 @@ class modelYIM(nn.Module):
         # ------------------------------------------------------------------
         """
             "input_features": feats,  # [T_i, F]
-            "feature_length": feat_len,
+            "feature_length": feat_len, 
             "text": text_value,
             "utt_id": utt_id,
         }
@@ -378,7 +378,7 @@ class modelYIM(nn.Module):
         # 1) 오디오 인코딩 (Conformer) - forward와 동일한 입력 형식 사용
         # ------------------------------------------------------------------
         features = samples["input_features"].to(self.device)          # [B, T_max, F]
-        input_lengths = samples["input_input_lengths"].to(self.device)  # [B]
+        input_lengths = samples["feature_length"].to(self.device)  # [B]
         batch_size = features.size(0)
 
         # Conformer: (B, T_max, F) + length[B] → (B, T_enc, C_enc), out_lengths[B]

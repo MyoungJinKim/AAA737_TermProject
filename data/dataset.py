@@ -4,11 +4,14 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import logging
+import torchaudio
+import io
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from datasets import load_dataset, Audio
+import soundfile as sf
 
 from .features import LogMelFeatureExtractor
 
@@ -154,14 +157,49 @@ class HuggingFaceSpeechDataset(Dataset):
 
         # ----- 오디오 로드 -----
         audio_dict = ex[self.audio_column]  # {"bytes": np.ndarray, ...}
-        wav = torch.tensor(audio_dict["bytes"], dtype=torch.float32)
-        if wav.dim() == 1:
-            wav = wav.unsqueeze(0)  # [1, T]
+        
+        audio_bytes = audio_dict["bytes"]
+        if not isinstance(audio_bytes, (bytes, bytearray)):
+            # pyarrow.scalar 같은 경우
+            audio_bytes = audio_bytes.as_py()
 
-        wav = self._fix_duration(wav)
+        # torchaudio.load 는 파일 경로나 file-like object 를 받으므로 BytesIO 로 감싼다
+        byte_buf = io.BytesIO(audio_bytes)
+        
+        # 1차: torchaudio.load 시도 (성공하면 그대로 사용)
+        try:
+            waveform, sr = torchaudio.load(byte_buf)  # [channels, T]
+            waveform = waveform.float()
+        except UnicodeDecodeError:
+            # ffmpeg backend가 메타데이터 decode에서 터진 경우 → soundfile로 fallback
+            byte_buf.seek(0)
+            data, sr = sf.read(byte_buf, dtype="float32", always_2d=True)  # [T, C]
+            # soundfile은 [T, C] 를 주므로 [C, T] 로 transpose
+            waveform = torch.from_numpy(data.T)  # [channels, T]
+        # float32 로 캐스팅
+        waveform = waveform.float()
 
-        # ----- feature 추출 -----
-        feats = self.feature_extractor(wav)  # [T_i, F]
+        # 필요하면 resample (데이터셋 sr != self.sample_rate 인 경우)
+        if sr != self.sample_rate:
+            waveform = torchaudio.functional.resample(
+                waveform,
+                orig_freq=sr,
+                new_freq=self.sample_rate,
+            )
+
+        # [C, T] → [1, T] 로 맞춤 (mono 가정)
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)  # [1, T]
+        elif waveform.size(0) > 1:
+            # 다채널이면 평균해서 mono
+            waveform = waveform.mean(dim=0, keepdim=True)  # [1, T]
+
+        # 길이 고정/패딩 처리
+        wav = self._fix_duration(waveform)
+
+        # ----- feature & token 추출 -----
+        feats = self.feature_extractor(wav)
+          # [T_i, F]
         feat_len = feats.size(0)
 
         # 텍스트는 raw string으로 가져옴
