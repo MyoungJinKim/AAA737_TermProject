@@ -51,7 +51,7 @@ python inference.py \
 학습된 모델의 성능을 테스트 데이터셋으로 평가하고 WER(Word Error Rate)을 계산할 수 있습니다.
 
 ```bash
-python evalutate.py \
+python evaluation.py \
   --config configs/evaluate_config.yaml \
   --ckpt {체크포인트 경로}
 ```
@@ -89,7 +89,7 @@ python evalutate.py \
 5.  **학습 실행 (`Runner`)**:
     *   `Runner` 클래스를 초기화하고 `runner.train()`을 호출하여 실제 학습 루프를 시작합니다.
 
-### `evalutate.py`
+### `evaluation.py`
 모델 평가를 수행하는 스크립트입니다. 주요 기능은 다음과 같습니다:
 
 1.  **설정 및 체크포인트 로드**:
