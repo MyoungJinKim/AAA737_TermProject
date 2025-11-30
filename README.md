@@ -1,18 +1,30 @@
 # AAA737_TermProject
 
 ## 프로젝트 개요
-이 프로젝트는 오디오 데이터를 처리하고 LLaMA 모델과 결합하여 학습하는 파이프라인을 구축합니다.
+이 프로젝트는 [Fathullah, Y., et al. "Prompting large language models with speech recognition abilities." (ICASSP, 2024)](https://arxiv.org/pdf/2307.11795) 논문에서 제시된 방법론을 구현한 프로젝트입니다.
+
+[Multilingual LibriSpeech Dataset](https://huggingface.co/datasets/facebook/multilingual_librispeech)을 이용하여, Conformer 기반의 오디오 인코더와 Decoder-Only 구조의 LLM을 결합해 오디오 입력만으로 텍스트를 추론하는 파이프라인을 구축합니다.
+
+## 전체 학습 파이프라인 (Training Pipeline Overview)
+본 프로젝트는 Fathullah, Y., et al. (2024) 논문의 방법론에 따라 다음 두 단계 학습으로 구성됩니다.
+* **Stage 1 - Conformer ASR Pre-training**  
+  * Conforemr encoder를 CTC Loss로 사전학습하여 오디오-텍스트 정렬을 학습하는 단계입니다.
+* **Stage 2 - Pre-trained Encoder + LLM Joint Training**  
+  * 사전학습된 Encoder를 LLM에 연결해 오디오 입력만으로 텍스트를 생성할 수 있도록 joint training을 수행합니다.  
+  * 이 과정에서 LLM은 LoRA 기반 파인튜닝 방식으로 학습되며, 파라미터 효율성이 높아집니다.
+* **Evaluation - Word Error Rate (WER)**
+  * 모델이 생성한 텍스트와 정답 텍스트를 비교하여 오류 비율을 계산하는 평가 지표로, 값이 낮을수록 성능이 더 우수함을 의미합니다.
 
 ## 실행 방법 (How to Run)
 
 `train.py` 스크립트를 사용하여 모델 학습을 시작할 수 있습니다.
 
 ### 1. 환경 설정
-필요한 라이브러리가 설치되어 있는지 확인하세요. (예: `torch`, `numpy`, `yaml` 등)
+필요한 라이브러리가 설치되어 있는지 확인합니다. (예: `torch`, `numpy`, `yaml` 등)
 
 ### 2. 설정 파일 확인
 학습 설정은 `configs/config.yaml` 파일에 정의되어 있습니다.
-`train.py` 내부에서 해당 경로(`/data_x/aa007878/deep/myung/configs/config.yaml`)를 참조하고 있으므로, 필요에 따라 경로를 수정하거나 설정 파일 내용을 변경하세요.
+`train.py` 내부에서 해당 경로(`/data_x/aa007878/deep/myung/configs/config.yaml`)를 참조하고 있으므로, 필요에 따라 경로를 수정하거나 설정 파일 내용을 변경하시기 바랍니다.
 
 ### 3. 학습 실행
 
@@ -33,7 +45,7 @@ torchrun --nproc_per_node=4 train.py
 스크립트는 기본적으로 GPU 0, 1, 2, 3번을 사용하도록 설정되어 있습니다 (`os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"`).
 
 ### 4. 추론 실행 (Inference)
-학습된 모델 체크포인트를 사용하여 오디오 파일을 텍스트로 변환(추론)할 수 있습니다.
+학습된 모델 체크포인트를 사용하여 오디오 파일을 텍스트로 변환하는 ASR을 수행할 수 있습니다.
 
 ```bash
 python inference.py \
